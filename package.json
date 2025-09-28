@@ -1,0 +1,10 @@
+{
+  "name": "rag-backend",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vercel/node": "3",
+    "@supabase/supabase-js": "^2.45.0",
+    "openai": "^4.58.0"
+  }
+}
