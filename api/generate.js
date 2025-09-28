@@ -83,7 +83,7 @@ export default async function handler(req, res) {
     const system = `You are a strict RAG assistant.
 - Answer ONLY using the provided context below.
 - If the information is not present, reply "Insufficient information."
-- Be concise, neutral, and diplomatic. Do NOT include bracketed citations or source IDs.`;
+- Be concise, neutral, and professional. Do NOT include bracketed citations or source IDs.`;
 
     const user = `Question: ${query}
 
