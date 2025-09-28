@@ -42,7 +42,7 @@ export default async function handler(req, res) {
 
     if (doc_id) results = results.filter(r => r.id.startsWith(`${doc_id}:`));
 
-    const MIN_SIM = 0.75;
+    const MIN_SIM = 0.2;
     results = results.filter(r => r.score >= MIN_SIM).slice(0, k);
 
     res.setHeader("content-type", "application/json; charset=utf-8");
