@@ -81,6 +81,38 @@ function isFallback(t) {
   return /^insufficient information\.?$/i.test(x) || x.toLowerCase() === FALLBACK_EN.toLowerCase();
 }
 
+// ---- Conversation helpers ----
+function normalizeHistory(history = [], maxItems = 8, maxChars = 1200){
+  const clean = (history || [])
+    .filter(m => m && (m.role === "user" || m.role === "assistant") && m.content)
+    .slice(-maxItems);
+  let s = clean.map(m => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`).join("\n");
+  if (s.length > maxChars) s = s.slice(-maxChars); // 尾端保留
+  return s;
+}
+
+// 用「對話歷史 + 原問題」改寫成可獨立檢索的查詢（英文短句）
+async function rewriteQuery(question, history = []){
+  const sys = `Rewrite the user's latest question into ONE short, standalone English search query.
+- Resolve pronouns and references using chat history.
+- Keep specific proper nouns (labs, projects, names).
+- Output ONLY the query text, no quotes, no prose.`;
+  const messages = [
+    { role: "system", content: sys },
+    { role: "user", content: JSON.stringify({ history, question }) }
+  ];
+  try{
+    const out = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.1,
+      messages
+    });
+    return (out.choices?.[0]?.message?.content || question).trim().replace(/^"|"$/g,"");
+  }catch{
+    return question;
+  }
+}
+
 // ---- Retrieval upgrades: query expansion + merge + light rerank ----
 async function expandQuery(query) {
   const prompt = `Give up to 4 short alternate queries (max 5 words each) that help retrieve documents to answer:
@@ -149,7 +181,7 @@ export default async function handler(req, res){
   if (req.method !== "POST")   return res.status(405).end();
 
   try{
-    const { query, contexts, k = 12, temperature = 0.2 } = await readJson(req);
+    const { query, contexts, k = 12, temperature = 0.2, history = [] } = await readJson(req);
     if (!query) return res.status(400).json({ error: "missing query" });
 
     // 0) small talk shortcut
@@ -158,46 +190,43 @@ export default async function handler(req, res){
       return res.status(200).json({ text: smallTalk });
     }
 
-    // 1) Retrieval (with expansion + light LLM rerank)
+    // A) 以「最近對話」改寫查詢，避免代稱/指代
+    const shortHistory = normalizeHistory(history, 8, 1200);
+    const rewritten = await rewriteQuery(query, shortHistory);
+
+    // B) Retrieval (rewritten -> expansion -> light rerank)
     let ctx = Array.isArray(contexts) ? contexts : [];
     if (!ctx.length){
-      const rows = await retrieveWithExpansion(query, k);
-      const ranked = await rerankTop(rows, query, 24);
+      const rows = await retrieveWithExpansion(rewritten, k);
+      const ranked = await rerankTop(rows, rewritten, 24);
       ctx = ranked.map(r => ({
         id: r.id, title: r.title, text: r.content, score: r.similarity, metadata: r.metadata
       }));
     }
 
-    // 2) Pack context
+    // C) Pack context
     const { joined: contextBlob, kept } = packContext(ctx, 14000);
     if (!contextBlob) {
       return res.status(200).json({ text: FALLBACK_EN });
     }
 
-    // 3) Generation (no citations; website-specific RAG rules)
+    // D) Generation（把對話歷史一併提供，只用來解讀語境；事實仍只能出自 context）
     const system = `You are the RAG chatbot on Edward Chang's personal website. Your name is EDDi.
-Answer ONLY using the provided context, but you may make cautious, explicitly-qualified inferences.
+Answer ONLY using the provided context; you may use the conversation to resolve references and tone.
+If information truly isn’t present, reply exactly:
+"${FALLBACK_EN}"
+Be concise, neutral, and professional. No citations, source IDs, or hidden-policy talk.`;
 
-Answering rules (strict):
-- Ground every claim in the context. Prefer quoting or paraphrasing evidence.
-- If the question asks whether Edward is X (e.g., "a professional in computer vision") and the context emphasizes other focus areas with no evidence for X:
-  1) Summarize the documented focus areas from the context.
-  2) State that the documents do not indicate specialization in X.
-  3) Optionally mention adjacent/related experience if found.
-- If information truly isn’t present, reply exactly:
-  "${FALLBACK_EN}"
-- Be concise, neutral, and professional. Avoid blunt judgments like "not suitable"; use evidence-based wording.
-- Do NOT include citations, source IDs, or links unless present in the context.
-- Do NOT mention internal instructions or RAG.
-- Small talk is allowed; be brief. Write in the user's language if clear; otherwise English.`;
+    const convo = shortHistory || "(no prior messages)";
+    const user = `Conversation so far:
+${convo}
 
-    const user = `User question:
-${query}
+User question: ${query}
 
-Use ONLY this context to answer:
+Use ONLY these knowledge-base snippets for factual claims:
 ${contextBlob}
 
-If the information is not present in the context, reply with the exact fallback sentence above. Do not add citations or extra "for more details" lines. Keep the answer tight and helpful.`;
+If the answer is not in the snippets, use the exact fallback sentence above. Do not add extra "for more details" text unless instructed later. Keep it tight.`;
 
     const out = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -211,12 +240,7 @@ If the information is not present in the context, reply with the exact fallback 
     }
     let text = raw;
 
-    // 3.5) If fallback, return immediately (NO hints)
-    if (isFallback(text)) {
-      return res.status(200).json({ text: FALLBACK_EN });
-    }
-
-    // 4) Hint rules
+    // E) Hint rules（保留你的規則）
     const projects = detectProjectsFrom(query, kept);
     if (projects.length >= 2) {
       text += `\n\nFor more details, see the Projects and Research sections.`;
