@@ -8,8 +8,8 @@
 //                            others            -> GitHub+Projects
 
 import OpenAI from "openai";
-import { embedText } from "../lib/embeddings.js";
-import { supabase } from "../lib/supabase.js";
+import { classifyIntent } from "../lib/intent.js";
+import { retrieveSmart, packContext } from "../lib/retrieve.js";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
@@ -34,7 +34,7 @@ function greetIfSmallTalk(q){
   return null;
 }
 
-// ---- Project detectors (keywords you can extend) ----
+// ---- Project detectors (for hint lines) ----
 const PROJECT_MATCHERS = [
   { key: "WATER_QUALITY", label: "Water Quality Prediction",
     re: /(water\s+quality|lstm[-\s]?ed|imputation|taipei\s+bridge)/i },
@@ -64,110 +64,48 @@ function detectProjectsFrom(query, keptRows){
   return found.filter(x => (seen.has(x.key) ? false : seen.add(x.key)));
 }
 
-function packContext(chunks, limit=14000){
-  let used=0, packed=[], kept=[];
-  for (const c of chunks){
-    const t = (c.text || c.content || c.chunk || "").toString().trim();
-    if (!t) continue;
-    if (used + t.length > limit) break;
-    packed.push(t); kept.push({ ...c, _t: t }); used += t.length;
-  }
-  return { joined: packed.join("\n\n---\n\n"), kept };
-}
-
 function isFallback(t) {
   if (!t) return true;
   const x = t.trim();
   return /^insufficient information\.?$/i.test(x) || x.toLowerCase() === FALLBACK_EN.toLowerCase();
 }
 
-// ---- Conversation helpers ----
-function normalizeHistory(history = [], maxItems = 8, maxChars = 1200){
-  const clean = (history || [])
-    .filter(m => m && (m.role === "user" || m.role === "assistant") && m.content)
-    .slice(-maxItems);
-  let s = clean.map(m => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`).join("\n");
-  if (s.length > maxChars) s = s.slice(-maxChars); // 尾端保留
-  return s;
+// ---- Templates ----
+function sysSTAR(fallback){
+  return `You are the RAG chatbot on Edward Chang's personal website. Your name is EDDi.
+Answer ONLY using the provided context. If missing, reply exactly:
+"${fallback}"
+
+When the user asks about experiences/challenges/impact/results, respond in STAR format:
+- Situation: 1–2 lines summarizing the problem/opportunity and setting.
+- Task: 1 line describing the specific responsibility or goal.
+- Action: 2–4 bullets focusing on concrete technical steps (tools, models, data, evaluation).
+- Result: 1–2 lines with measurable outcomes (metrics, awards, impact) if present in context.
+
+Be crisp, factual, and avoid speculation. Do NOT include citations or source IDs.`;
 }
 
-// 用「對話歷史 + 原問題」改寫成可獨立檢索的查詢（英文短句）
-async function rewriteQuery(question, history = []){
-  const sys = `Rewrite the user's latest question into ONE short, standalone English search query.
-- Resolve pronouns and references using chat history.
-- Keep specific proper nouns (labs, projects, names).
-- Output ONLY the query text, no quotes, no prose.`;
-  const messages = [
-    { role: "system", content: sys },
-    { role: "user", content: JSON.stringify({ history, question }) }
-  ];
-  try{
-    const out = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      messages
-    });
-    return (out.choices?.[0]?.message?.content || question).trim().replace(/^"|"$/g,"");
-  }catch{
-    return question;
-  }
+function sysFIT(fallback){
+  return `You are the RAG chatbot on Edward Chang's personal website. Your name is EDDi.
+Answer ONLY using the provided context. If missing, reply exactly:
+"${fallback}"
+
+For fit/suitability questions:
+- Summarize documented strengths, skills, and representative projects relevant to the role.
+- Use evidence-based wording from the context; avoid blunt negatives.
+- If something isn't evidenced, say "the documents do not indicate ...".
+Be concise and professional. No citations.`;
 }
 
-// ---- Retrieval upgrades: query expansion + merge + light rerank ----
-async function expandQuery(query) {
-  const prompt = `Give up to 4 short alternate queries (max 5 words each) that help retrieve documents to answer:
-Q: "${query}"
-Return as a JSON array of strings. No prose.`;
-  try {
-    const r = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      messages: [{ role: "user", content: prompt }]
-    });
-    const txt = r.choices?.[0]?.message?.content?.trim() || "[]";
-    const arr = JSON.parse(txt);
-    return Array.isArray(arr) ? arr.filter(Boolean).slice(0,4) : [];
-  } catch { return []; }
+function sysFACTUAL(fallback){
+  return `You are the RAG chatbot on Edward Chang's personal website. Your name is EDDi.
+Answer ONLY using the provided context. If information is missing, reply exactly:
+"${fallback}"
+Answer concisely with verified facts. No citations.`;
 }
 
-async function retrieveWithExpansion(baseQuery, k) {
-  const queries = [baseQuery, ...(await expandQuery(baseQuery))];
-  const seen = new Map(); // id -> best row
-  for (const q of queries) {
-    const vec = await embedText(q);
-    const { data, error } = await supabase.rpc("match_documents", {
-      query_embedding: vec,
-      match_count: Math.max(12, k * 4)
-    });
-    if (error) continue;
-    for (const r of (data || [])) {
-      const id = r.id;
-      const prev = seen.get(id);
-      if (!prev || (r.similarity > prev.similarity)) seen.set(id, r);
-    }
-  }
-  return Array.from(seen.values()).sort((a,b)=>b.similarity - a.similarity);
-}
-
-async function rerankTop(rows, query, topN=24) {
-  const pool = rows.slice(0, topN);
-  if (!pool.length) return pool;
-  const list = pool.map((r,i)=>`[${i}] ${r.title}\n${(r.content||"").slice(0,600)}`).join("\n\n");
-  const prompt = `Rank the following snippets by how directly they help answer: "${query}".
-Return a JSON array of indices in best-to-worst order. No prose.\n\n${list}`;
-  try {
-    const r = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      messages: [{ role:"user", content: prompt }]
-    });
-    const order = JSON.parse(r.choices?.[0]?.message?.content ?? "[]");
-    const ranked = order.map(i => pool[i]).filter(Boolean);
-    const rest = pool.filter(x => !ranked.includes(x));
-    return [...ranked, ...rest];
-  } catch {
-    return pool;
-  }
+function sysSMALL_TALK(){
+  return `You are EDDi on Edward's site. Be brief and friendly. If the user asks for info, you can help with background, labs, projects, resume, or GitHub. Do not invent facts.`;
 }
 
 // ---------- handler ----------
@@ -181,7 +119,7 @@ export default async function handler(req, res){
   if (req.method !== "POST")   return res.status(405).end();
 
   try{
-    const { query, contexts, k = 12, temperature = 0.2, history = [] } = await readJson(req);
+    const { query, k = 12, temperature = 0.2, sessionId = null } = await readJson(req);
     if (!query) return res.status(400).json({ error: "missing query" });
 
     // 0) small talk shortcut
@@ -190,48 +128,40 @@ export default async function handler(req, res){
       return res.status(200).json({ text: smallTalk });
     }
 
-    // A) 以「最近對話」改寫查詢，避免代稱/指代
-    const shortHistory = normalizeHistory(history, 8, 1200);
-    const rewritten = await rewriteQuery(query, shortHistory);
+    // 1) 意圖分類
+    const { intent, project_hints } = await classifyIntent(query);
 
-    // B) Retrieval (rewritten -> expansion -> light rerank)
-    let ctx = Array.isArray(contexts) ? contexts : [];
-    if (!ctx.length){
-      const rows = await retrieveWithExpansion(rewritten, k);
-      const ranked = await rerankTop(rows, rewritten, 24);
-      ctx = ranked.map(r => ({
-        id: r.id, title: r.title, text: r.content, score: r.similarity, metadata: r.metadata
-      }));
-    }
+    // 2) （選配）會話摘要（這裡先不強制，需要你之後自己加表，沒有就當空字串）
+    const historySnippet = ""; // 留白：未建 conversations 表時不影響功能
 
-    // C) Pack context
-    const { joined: contextBlob, kept } = packContext(ctx, 14000);
+    // 3) 智慧檢索
+    const rows = await retrieveSmart(query, { k: Math.max(18, k*2), project_hints, historySnippet });
+    const { joined: contextBlob, kept } = packContext(rows, 14000);
     if (!contextBlob) {
       return res.status(200).json({ text: FALLBACK_EN });
     }
 
-    // D) Generation（把對話歷史一併提供，只用來解讀語境；事實仍只能出自 context）
-    const system = `You are the RAG chatbot on Edward Chang's personal website. Your name is EDDi.
-Answer ONLY using the provided context; you may use the conversation to resolve references and tone.
-If information truly isn’t present, reply exactly:
-"${FALLBACK_EN}"
-Be concise, neutral, and professional. No citations, source IDs, or hidden-policy talk.`;
+    // 4) 選模板 & 生成
+    let sys;
+    switch (intent) {
+      case "STAR":       sys = sysSTAR(FALLBACK_EN); break;
+      case "FIT":        sys = sysFIT(FALLBACK_EN); break;
+      case "SMALL_TALK": sys = sysSMALL_TALK(); break;
+      default:           sys = sysFACTUAL(FALLBACK_EN); break;
+    }
 
-    const convo = shortHistory || "(no prior messages)";
-    const user = `Conversation so far:
-${convo}
+    const userMsg = `User question:
+${query}
 
-User question: ${query}
-
-Use ONLY these knowledge-base snippets for factual claims:
+Use ONLY this context to answer:
 ${contextBlob}
 
-If the answer is not in the snippets, use the exact fallback sentence above. Do not add extra "for more details" text unless instructed later. Keep it tight.`;
+If the information is not present, reply with the exact fallback sentence (no extras). keep it concise.`;
 
     const out = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature,
-      messages: [{ role: "system", content: system }, { role: "user", content: user }]
+      messages: [{ role: "system", content: sys }, { role: "user", content: userMsg }]
     });
 
     const raw = out.choices?.[0]?.message?.content?.trim() ?? "";
@@ -240,7 +170,7 @@ If the answer is not in the snippets, use the exact fallback sentence above. Do 
     }
     let text = raw;
 
-    // E) Hint rules（保留你的規則）
+    // 5) 你的提示規則（多/單專案的「for more...」）
     const projects = detectProjectsFrom(query, kept);
     if (projects.length >= 2) {
       text += `\n\nFor more details, see the Projects and Research sections.`;
