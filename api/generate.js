@@ -1,9 +1,5 @@
 // api/generate.js
 // - 9 intents with tailored response styles (no citations)
-// - small talk allowed
-// - BOOLEAN 無證據 → 溫和否定訊息 (非通用 fallback)
-// - multi/single project "for more..." hints 保留
-// - 支援 history + debug + 句數/長度上限
 
 import OpenAI from "openai";
 import { classifyIntent, extractProjectHints } from "../lib/intent.js";
@@ -72,7 +68,7 @@ function isFallback(t) {
   return /^insufficient information\.?$/i.test(x) || x.toLowerCase() === FALLBACK_EN.toLowerCase();
 }
 
-// 句子裁切（中英文終止符）
+// sentence clip by . or 。
 function trimToSentences(text, maxSentences, maxChars=1600){
   if (!text) return text;
   const parts = text.split(/(?<=[。！？.!?])\s+/u).filter(Boolean);
@@ -83,7 +79,7 @@ function trimToSentences(text, maxSentences, maxChars=1600){
   return clipped;
 }
 
-/* ---- 專案偵測（for more… 提示） ---- */
+/* ---- project detection ---- */
 const PROJECT_MATCHERS = [
   { key: "WATER_QUALITY", label: "Water Quality Prediction",
     re: /(water\s+quality|lstm[-\s]?ed|imputation|taipei\s+bridge)/i },
@@ -113,7 +109,7 @@ function detectProjectsFrom(query, keptRows){
   return found.filter(x => (seen.has(x.key) ? false : seen.add(x.key)));
 }
 
-/* ---------- 9 種回應風格 (system prompt) ---------- */
+/* ---------- 9 system prompt ---------- */
 function systemFor(intent){
   switch(intent){
     case "STAR": return `You are EDDi on Edward Chang's personal website.
@@ -190,8 +186,8 @@ export default async function handler(req, res){
     if (smallTalk) return res.status(200).json({ text: smallTalk });
 
     // 1) 意圖 & 專案線索
-    const intent = await classifyIntent(query);               // <- 應回傳 9 類其中之一或 GENERIC
-    const project_hints = extractProjectHints(query);         // <- 可選：幫助檢索偏向某專案
+    const intent = await classifyIntent(query);               
+    const project_hints = extractProjectHints(query);         
 
     // 2) 智慧檢索（對話改寫 + HyDE + 展開 + 重排）— 實作在 ../lib/retrieve.js
     const rows = await retrieveSmart(query, { k: Math.max(18, k*2), history, project_hints });
